@@ -83,6 +83,61 @@ describe('helpers::toFormData', function () {
     });
   });
 
+  describe('options inherited only from Object.prototype', function () {
+    function pollute(key, value) {
+      Object.defineProperty(Object.prototype, key, {
+        value: value,
+        configurable: true,
+        writable: true
+      });
+    }
+
+    function createFormDataSpy() {
+      return {
+        calls: [],
+        append: function (key, value) {
+          this.calls.push([key, value]);
+        }
+      };
+    }
+
+    afterEach(function () {
+      delete Object.prototype.visitor;
+      delete Object.prototype.maxDepth;
+    });
+
+    it('should ignore a visitor inherited only from Object.prototype', function () {
+      let called = false;
+      pollute('visitor', function () {
+        called = true;
+        return false;
+      });
+
+      const formData = createFormDataSpy();
+      toFormData({ field: 'value' }, formData);
+
+      assert.strictEqual(called, false);
+      assert.deepStrictEqual(formData.calls, [['field', 'value']]);
+    });
+
+    it('should ignore maxDepth inherited only from Object.prototype', function () {
+      pollute('maxDepth', 0);
+
+      const formData = createFormDataSpy();
+      assert.doesNotThrow(function () {
+        toFormData({ nested: { field: 'value' } }, formData);
+      });
+      assert.deepStrictEqual(formData.calls, [['nested[field]', 'value']]);
+    });
+
+    it('should still honor own options', function () {
+      const formData = createFormDataSpy();
+      toFormData({ nested: { field: 'value' } }, formData, { dots: true });
+
+      assert.deepStrictEqual(formData.calls, [['nested.field', 'value']]);
+    });
+  });
+
   describe('maxDepth — params serialization via AxiosURLSearchParams', function () {
     it('should throw AxiosError for deeply nested params object (default limit)', function () {
       try {
