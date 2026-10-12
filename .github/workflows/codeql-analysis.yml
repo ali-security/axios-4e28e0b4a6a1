@@ -1,20 +1,7 @@
 name: 'CodeQL'
 
 on:
-  push:
-    branches:
-      - '*'
-      - '*/*'
-      - '**'
-      - '!sponsors'
-  pull_request:
-    branches:
-      - '*'
-      - '*/*'
-      - '**'
-      - '!sponsors'
-  schedule:
-    - cron: '21 23 * * 5'
+  workflow_dispatch:
 
 jobs:
   analyze:
