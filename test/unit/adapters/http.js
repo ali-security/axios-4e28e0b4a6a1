@@ -1968,6 +1968,247 @@ describe('supports http with nodejs', function () {
         );
       }
     });
+
+    // End-to-end exercise of the redirect leak. An
+    // authenticated env-supplied proxy sees the initial request, 302s the
+    // client to a target that NO_PROXY excludes, and the redirected request
+    // must not carry the stale Proxy-Authorization to the direct target.
+    it('does not forward Proxy-Authorization to a redirect target that resolves to no-proxy', async function () {
+      this.timeout(10000);
+      const startServer = (handler) =>
+        new Promise((resolve) => {
+          const s = http.createServer(handler);
+          s.listen(0, '127.0.0.1', () => resolve(s));
+        });
+      const stop = (s) => new Promise((r) => s.close(r));
+
+      let attackerPort;
+      const proxySaw = [];
+      const attackerSaw = [];
+
+      // The proxy receives the absolute-form URL (`GET http://target/path`) on
+      // the initial request, then forwards to the destination. We short-circuit
+      // by responding directly with the redirect.
+      const corpProxy = await startServer((req, res) => {
+        proxySaw.push({ url: req.url, proxyAuth: req.headers['proxy-authorization'] });
+        res.writeHead(302, { Location: `http://127.0.0.1:${attackerPort}/final` });
+        res.end();
+      });
+
+      const attacker = await startServer((req, res) => {
+        attackerSaw.push({
+          url: req.url,
+          proxyAuth: req.headers['proxy-authorization'],
+          authorization: req.headers.authorization,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"final":true}');
+      });
+      attackerPort = attacker.address().port;
+
+      const corpProxyPort = corpProxy.address().port;
+      const originalHttpProxy = process.env.http_proxy;
+      const originalNoProxy = process.env.no_proxy;
+      process.env.http_proxy = `http://user:pass@127.0.0.1:${corpProxyPort}`;
+      // NO_PROXY entry covers only the attacker target (port-specific), so the
+      // initial request still uses the proxy but the redirect resolves direct.
+      process.env.no_proxy = `127.0.0.1:${attackerPort}`;
+
+      try {
+        await axios.get('http://example.com/start');
+
+        assert.ok(
+          proxySaw.some((h) => h.proxyAuth),
+          'precondition: corp proxy must see Proxy-Authorization on the initial request'
+        );
+        assert.strictEqual(
+          attackerSaw.length,
+          1,
+          'attacker target must receive exactly the redirected request'
+        );
+        assert.strictEqual(
+          attackerSaw[0].proxyAuth,
+          undefined,
+          'stale Proxy-Authorization must not leak to the redirect target'
+        );
+      } finally {
+        if (originalHttpProxy === undefined) delete process.env.http_proxy;
+        else process.env.http_proxy = originalHttpProxy;
+        if (originalNoProxy === undefined) delete process.env.no_proxy;
+        else process.env.no_proxy = originalNoProxy;
+        await stop(corpProxy);
+        await stop(attacker);
+      }
+    });
+  });
+
+  // A polluted Object.prototype must not be able to supply proxy fields
+  // (credentials, host, port, protocol) that the configured or environment proxy
+  // does not own, otherwise it can inject credentials or redirect proxying to an
+  // attacker-controlled host.
+  describe('setProxy prototype pollution', () => {
+    const pollutedKeys = ['auth', 'username', 'password', 'hostname', 'host', 'port', 'protocol'];
+    const clearPollution = () => {
+      pollutedKeys.forEach((key) => {
+        delete Object.prototype[key];
+      });
+    };
+
+    afterEach(clearPollution);
+
+    it('ignores polluted prototype Host fields when building the forwarded host header', () => {
+      const options = {
+        headers: {},
+        beforeRedirects: {},
+        hostname: '127.0.0.1',
+        port: 4000,
+      };
+
+      Object.prototype.host = 'polluted.example.com';
+
+      try {
+        __setProxy(options, { hostname: '127.0.0.2', port: 8030 }, 'http://127.0.0.1:4000/');
+      } finally {
+        clearPollution();
+      }
+
+      assert.strictEqual(options.headers.host, '127.0.0.1:4000');
+      assert.strictEqual(options.host, '127.0.0.2');
+      assert.strictEqual(options.hostname, '127.0.0.2');
+    });
+
+    it('ignores polluted hostname/port/protocol that the configured proxy does not own', () => {
+      const options = {
+        headers: {},
+        beforeRedirects: {},
+        hostname: 'target.example.com',
+        port: 80,
+      };
+
+      Object.prototype.hostname = 'attacker.example.com';
+      Object.prototype.port = 31337;
+      Object.prototype.protocol = 'https';
+
+      try {
+        __setProxy(options, { host: '127.0.0.1' }, 'http://target.example.com/');
+      } finally {
+        clearPollution();
+      }
+
+      assert.strictEqual(options.hostname, '127.0.0.1');
+      assert.strictEqual(options.host, '127.0.0.1');
+      assert.strictEqual(options.port, undefined);
+      assert.strictEqual(options.protocol, undefined);
+      assert.strictEqual(options.headers.host, 'target.example.com:80');
+    });
+
+    it('does not inject Proxy-Authorization from polluted Object.prototype.auth on an environment proxy', () => {
+      const options = {
+        headers: {},
+        beforeRedirects: {},
+        hostname: 'example.com',
+        port: 80,
+      };
+
+      process.env.http_proxy = 'http://127.0.0.1:8030';
+      Object.prototype.auth = 'attacker:exfil';
+
+      try {
+        __setProxy(options, undefined, 'http://example.com/');
+      } finally {
+        clearPollution();
+      }
+
+      assert.strictEqual(options.headers['Proxy-Authorization'], undefined);
+      assert.strictEqual(options.hostname, '127.0.0.1');
+      assert.strictEqual(options.port, '8030');
+    });
+
+    it('does not let polluted username/password override a configured proxy auth string', () => {
+      const options = {
+        headers: {},
+        beforeRedirects: {},
+        hostname: 'example.com',
+        port: 80,
+      };
+
+      Object.prototype.username = 'attacker';
+      Object.prototype.password = 'exfil';
+
+      try {
+        __setProxy(options, { host: '127.0.0.1', port: 8030, auth: 'user:pass' }, 'http://example.com/');
+      } finally {
+        clearPollution();
+      }
+
+      assert.strictEqual(
+        options.headers['Proxy-Authorization'],
+        'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64')
+      );
+    });
+
+    it('does not proxy an IPv4-mapped IPv6 target when no_proxy lists the IPv4 address', () => {
+      const options = {
+        headers: {},
+        beforeRedirects: {},
+        hostname: '::ffff:c000:201',
+        port: 80,
+      };
+
+      process.env.http_proxy = 'http://user:pass@127.0.0.1:8030';
+      process.env.no_proxy = '192.0.2.1';
+
+      // Node's URL parser canonicalises [::ffff:192.0.2.1] to [::ffff:c000:201].
+      __setProxy(options, undefined, 'http://[::ffff:c000:201]/');
+
+      assert.strictEqual(options.hostname, '::ffff:c000:201');
+      assert.strictEqual(options.port, 80);
+      assert.strictEqual(options.headers['Proxy-Authorization'], undefined);
+    });
+
+    it('should not use inherited proxy auth credentials', function (done) {
+      Object.prototype.auth = {};
+      Object.prototype.username = 'polluted-user';
+      Object.prototype.password = 'polluted-pass';
+
+      server = http.createServer(function (req, res) {
+        res.end();
+      }).listen(4444, function () {
+        proxy = http.createServer(function (request, response) {
+          const parsed = url.parse(request.url);
+          // Null-prototype options so the polluted Object.prototype.auth is not
+          // picked up by the forwarding request inside this test proxy.
+          const opts = Object.create(null);
+          opts.host = parsed.hostname;
+          opts.port = parsed.port;
+          opts.path = parsed.path;
+          opts.auth = undefined;
+          const proxyAuth = request.headers['proxy-authorization'];
+
+          http.get(opts, function (res) {
+            res.on('data', function () {});
+            res.on('end', function () {
+              response.setHeader('Content-Type', 'text/html; charset=UTF-8');
+              response.end(proxyAuth || '');
+            });
+          });
+        }).listen(4000, function () {
+          axios.get('http://localhost:4444/', {
+            proxy: {
+              host: 'localhost',
+              port: 4000
+            }
+          }).then(function (res) {
+            clearPollution();
+            assert.equal(res.data, '');
+            done();
+          }).catch(function (err) {
+            clearPollution();
+            done(err);
+          });
+        });
+      });
+    });
   });
 
   it('should support cancel', function (done) {

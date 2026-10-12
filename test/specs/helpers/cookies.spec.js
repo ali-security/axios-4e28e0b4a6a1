@@ -23,6 +23,64 @@ describe('helpers::cookies', function () {
     expect(cookies.read('bar')).toEqual('def');
   });
 
+  it('should read cookies when the cookie separator has no following space', function () {
+    const descriptor = Object.getOwnPropertyDescriptor(document, 'cookie');
+
+    Object.defineProperty(document, 'cookie', {
+      configurable: true,
+      get: function () {
+        return 'foo=abc;bar=def';
+      }
+    });
+
+    try {
+      expect(cookies.read('bar')).toEqual('def');
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(document, 'cookie', descriptor);
+      } else {
+        delete document.cookie;
+      }
+    }
+  });
+
+  it('should read cookie names containing regex metacharacters literally', function () {
+    cookies.write('foo.*', 'abc');
+    cookies.write('foo-value', 'def');
+
+    expect(cookies.read('foo.*')).toEqual('abc');
+  });
+
+  it('should not treat regex-like cookie names as patterns', function () {
+    cookies.write('foo-value', 'def');
+
+    expect(cookies.read('foo.*')).toEqual(null);
+  });
+
+  it('should not throw when reading an invalid regex string as a cookie name', function () {
+    cookies.write('foo', 'abc');
+
+    expect(function () {
+      expect(cookies.read('[')).toEqual(null);
+    }).not.toThrow();
+  });
+
+  it('should match cookie names exactly even when the name contains regex metacharacters', function () {
+    // previously cookies.read built a RegExp by interpolating
+    // the requested name. Metacharacters could match a different cookie or trigger
+    // catastrophic backtracking. A name such as "X.Y" must not match a cookie called
+    // "XAY" set by the same site.
+    cookies.write('XAY', 'wrong');
+
+    expect(cookies.read('X.Y')).toEqual(null);
+  });
+
+  it('should not return a partial match for a name that is a prefix of another cookie', function () {
+    cookies.write('xsrf-token-extra', 'wrong');
+
+    expect(cookies.read('xsrf-token')).toEqual(null);
+  });
+
   it('should remove cookies', function () {
     cookies.write('foo', 'bar');
     cookies.remove('foo');
