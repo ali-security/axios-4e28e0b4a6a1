@@ -54,6 +54,27 @@ describe('requests', function () {
     });
   });
 
+  it('should not send a body inherited from Object.prototype for bodyless methods', function (done) {
+    Object.defineProperty(Object.prototype, 'data', {
+      value: 'INJECTED',
+      configurable: true,
+      writable: true
+    });
+
+    axios.delete('/foo');
+
+    getAjaxRequest().then(function (request) {
+      delete Object.prototype.data;
+      expect(request.method).toBe('DELETE');
+      expect(request.params).not.toBe('INJECTED');
+      expect(request.params == null).toBe(true);
+      done();
+    }, function (err) {
+      delete Object.prototype.data;
+      done.fail(err);
+    });
+  });
+
   it('should make an http request', function (done) {
     axios('/foo');
 
