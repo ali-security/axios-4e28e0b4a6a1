@@ -199,6 +199,66 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should sanitize request headers containing CRLF characters', async function () {
+    let requests = 0;
+
+    server = await startHTTPServer((req, res) => {
+      requests += 1;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        xTest: req.headers['x-test'],
+        injected: req.headers.injected === undefined ? null : req.headers.injected
+      }));
+    });
+
+    const {data} = await axios.get(`http://localhost:${server.address().port}/`, {
+      headers: {
+        'x-test': '\tok\r\nInjected: yes '
+      }
+    });
+
+    assert.strictEqual(data.xTest, 'okInjected: yes');
+    assert.strictEqual(data.injected, null);
+    assert.strictEqual(requests, 1);
+  });
+
+  it('should not allow CRLF in request headers to smuggle an extra request', async function () {
+    const received = [];
+
+    server = await startHTTPServer((req, res) => {
+      received.push({method: req.method, url: req.url, headers: req.headers});
+      res.end('ok');
+    });
+
+    const {data} = await axios.get(`http://localhost:${server.address().port}/pings`, {
+      headers: {
+        'x-amz-target': 'dummy\r\n\r\nPUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\n' +
+          'X-aws-ec2-metadata-token-ttl-seconds: 21600\r\n\r\nGET /ignore'
+      }
+    });
+
+    assert.strictEqual(data, 'ok');
+    assert.strictEqual(received.length, 1);
+    assert.strictEqual(received[0].method, 'GET');
+    assert.strictEqual(received[0].url, '/pings');
+    assert.strictEqual(received[0].headers['x-aws-ec2-metadata-token-ttl-seconds'], undefined);
+    assert.strictEqual(/[\r\n]/.test(received[0].headers['x-amz-target']), false);
+  });
+
+  it('should not throw an invalid header error for an unavailable host with CRLF in headers', async function () {
+    await assert.rejects(
+      axios.get('http://localhost:1/', {
+        headers: {
+          'x-test': 'ok\r\nInjected: yes'
+        }
+      }),
+      (err) => {
+        assert.strictEqual(/Invalid character in header content/.test(err.message), false);
+        return true;
+      }
+    );
+  });
+
   it('should throw an error if the timeout property is not parsable as a number', function (done) {
 
     server = http.createServer(function (req, res) {

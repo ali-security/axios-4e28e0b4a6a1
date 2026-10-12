@@ -74,6 +74,44 @@ describe('AxiosHeaders', function () {
 
       assert.strictEqual(headers.get('foo'), 'value2');
     })
+
+    it('should sanitize invalid characters in header value', function () {
+      const headers = new AxiosHeaders();
+
+      headers.set('x-test', '\t safe\r\nInjected: true \u0000');
+
+      assert.strictEqual(headers.get('x-test'), 'safeInjected: true');
+    });
+
+    it('should sanitize invalid characters in any array header value', function () {
+      const headers = new AxiosHeaders();
+
+      headers.set('set-cookie', ['safe=1', ' \tunsafe=1\nInjected: true\r\n ']);
+
+      assert.deepStrictEqual(headers.get('set-cookie'), ['safe=1', 'unsafe=1Injected: true']);
+    });
+
+    it('should not allow CRLF in header values to smuggle an extra request', function () {
+      const headers = new AxiosHeaders({
+        'x-amz-target': 'dummy\r\n\r\nPUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\n' +
+          'X-aws-ec2-metadata-token-ttl-seconds: 21600\r\n\r\nGET /ignore'
+      });
+
+      const value = headers.get('x-amz-target');
+
+      assert.strictEqual(/[\r\n]/.test(value), false);
+      assert.strictEqual(value, 'dummyPUT /latest/api/token HTTP/1.1Host: 169.254.169.254' +
+        'X-aws-ec2-metadata-token-ttl-seconds: 21600GET /ignore');
+      assert.strictEqual(/[\r\n]/.test(headers.toString()), false);
+    });
+
+    it('should sanitize header values assigned directly when normalized', function () {
+      const headers = new AxiosHeaders();
+
+      headers['x-test'] = 'ok\r\nInjected: yes';
+
+      assert.strictEqual(headers.normalize().get('x-test'), 'okInjected: yes');
+    });
   });
 
   it('should support uppercase name mapping for names overlapped by class methods', () => {
