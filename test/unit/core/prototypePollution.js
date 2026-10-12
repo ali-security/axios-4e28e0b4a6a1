@@ -11,11 +11,17 @@ import AxiosHeaders from "../../../lib/core/AxiosHeaders.js";
 import buildURL from "../../../lib/helpers/buildURL.js";
 import resolveConfig from "../../../lib/helpers/resolveConfig.js";
 import httpAdapter from "../../../lib/adapters/http.js";
+import defaults from "../../../lib/defaults/index.js";
 
 describe("Prototype Pollution Protection", function () {
   afterEach(function () {
     // Clean up any pollution that might have occurred
     delete Object.prototype.polluted;
+    delete Object.prototype.transport;
+    delete Object.prototype.transformRequest;
+    delete Object.prototype.transformResponse;
+    delete Object.prototype.formSerializer;
+    delete Object.prototype.env;
   });
 
   describe("utils.merge", function () {
@@ -196,6 +202,43 @@ describe("Prototype Pollution Protection", function () {
       assert.strictEqual(Object.prototype.polluted, undefined);
       assert.strictEqual(result.customProp.safe, "value");
       assert.strictEqual(result.customProp.hasOwnProperty("__proto__"), false);
+    });
+
+    it("should not inherit transport from Object.prototype", function () {
+      Object.prototype.transport = { request: function () {} };
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(result.hasOwnProperty("transport"), false);
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transport"),
+        false
+      );
+    });
+
+    it("should not inherit transformRequest from Object.prototype", function () {
+      Object.prototype.transformRequest = function () { return "hijacked"; };
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transformRequest"),
+        false
+      );
+    });
+
+    it("should not inherit transformResponse from Object.prototype", function () {
+      Object.prototype.transformResponse = function () { return "hijacked"; };
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transformResponse"),
+        false
+      );
+    });
+
+    it("should not inherit arbitrary keys from Object.prototype", function () {
+      Object.prototype.polluted = "yes";
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "polluted"),
+        false
+      );
     });
 
     it("should still merge configs correctly", function () {
@@ -983,6 +1026,450 @@ describe("Prototype pollution gadgets in request construction (CVE-2026-67316)",
       } finally {
         delete Object.prototype[Symbol.iterator];
       }
+    });
+  });
+
+  describe("config value gadgets (CVE-2026-42033)", function () {
+    const gadgetKeys = [
+      "transport",
+      "transformRequest",
+      "transformResponse",
+      "transitional",
+      "validateStatus",
+      "formSerializer",
+      "env",
+      "lookup",
+      "family",
+      "responseType",
+      "responseEncoding",
+    ];
+
+    afterEach(function () {
+      gadgetKeys.forEach(function (key) {
+        delete Object.prototype[key];
+      });
+    });
+
+    function ownValue(obj, key) {
+      return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+    }
+
+    function stubTransport(body, onRequest, statusCode) {
+      return {
+        request: function (options, handleResponse) {
+          if (onRequest) {
+            onRequest(options);
+          }
+          const req = new EventEmitter();
+          req.write = function () {
+            return true;
+          };
+          req.setTimeout = function () {};
+          req.destroy = function () {};
+          req.end = function () {
+            const res = new stream.Readable({ read: function () {} });
+            res.statusCode = statusCode || 200;
+            res.statusMessage = "OK";
+            res.headers = { "content-type": "application/json" };
+            res.rawHeaders = [];
+            res.req = req;
+            process.nextTick(function () {
+              handleResponse(res);
+              res.push(Buffer.from(body, "utf8"));
+              res.push(null);
+            });
+          };
+          return req;
+        },
+      };
+    }
+
+    function captureAdapter(seen, responseBody) {
+      return function (config) {
+        seen.config = config;
+        return Promise.resolve({
+          data: responseBody === undefined ? null : responseBody,
+          status: 200,
+          statusText: "OK",
+          headers: {},
+          config: config,
+          request: {},
+        });
+      };
+    }
+
+    describe("mergeConfig", function () {
+      it("should keep own transformRequest/transformResponse when they are polluted on Object.prototype", function () {
+        const safeRequest = function (data) {
+          return data;
+        };
+        const safeResponse = function (data) {
+          return data;
+        };
+
+        pollute("transformRequest", [
+          function () {
+            return "hijacked";
+          },
+        ]);
+        pollute("transformResponse", [
+          function () {
+            return "hijacked";
+          },
+        ]);
+
+        const result = mergeConfig(
+          { transformRequest: [safeRequest], transformResponse: [safeResponse] },
+          { url: "/a" },
+        );
+
+        assert.strictEqual(result.transformRequest.length, 1);
+        assert.strictEqual(result.transformRequest[0], safeRequest);
+        assert.strictEqual(result.transformResponse.length, 1);
+        assert.strictEqual(result.transformResponse[0], safeResponse);
+      });
+
+      it("should keep own transport when Object.prototype.transport is polluted", function () {
+        const safeRequest = function () {};
+
+        pollute("transport", {
+          request: function () {
+            throw new Error("hijacked");
+          },
+        });
+
+        const result = mergeConfig({ transport: { request: safeRequest } }, { url: "/a" });
+
+        assert.strictEqual(result.transport.request, safeRequest);
+      });
+
+      it("should not merge polluted Object.prototype values into own nested options", function () {
+        pollute("transitional", { injected: true, silentJSONParsing: false });
+
+        const result = mergeConfig({}, { transitional: { forcedJSONParsing: false } });
+
+        assert.strictEqual(result.transitional.forcedJSONParsing, false);
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(result.transitional, "injected"), false);
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(result.transitional, "silentJSONParsing"), false);
+      });
+
+      it("should keep own validateStatus when Object.prototype.validateStatus is polluted", function () {
+        const safeValidateStatus = function (status) {
+          return status >= 200 && status < 300;
+        };
+
+        pollute("validateStatus", function () {
+          return true;
+        });
+
+        const result = mergeConfig({ validateStatus: safeValidateStatus }, { url: "/a" });
+
+        assert.strictEqual(result.validateStatus, safeValidateStatus);
+      });
+    });
+
+    describe("request/response transforms", function () {
+      it("should not let a polluted transformResponse tamper with response data", async function () {
+        const seen = {};
+
+        pollute("transformResponse", [
+          function () {
+            return { role: "admin", balance: 999999 };
+          },
+        ]);
+
+        const response = await axios.get("/account", {
+          adapter: captureAdapter(seen, '{"role":"user","balance":100}'),
+        });
+
+        assert.deepStrictEqual(response.data, { role: "user", balance: 100 });
+      });
+
+      it("should not let a polluted transformRequest rewrite the request body", async function () {
+        const seen = {};
+
+        pollute("transformRequest", [
+          function () {
+            return "hijacked";
+          },
+        ]);
+
+        await axios.post("/submit", { a: 1 }, { adapter: captureAdapter(seen) });
+
+        assert.strictEqual(seen.config.data, '{"a":1}');
+      });
+
+      it("should never invoke polluted transform gadgets, not even as option validators", async function () {
+        const seen = {};
+        const leaked = [];
+
+        // A gadget that passes option validation (returns true) and then
+        // tampers with data / exfiltrates the config when used as a transform.
+        function gadget(value, opt, opts) {
+          leaked.push(opts);
+          return true;
+        }
+
+        pollute("transformRequest", gadget);
+        pollute("transformResponse", gadget);
+
+        const response = await axios.post(
+          "/submit",
+          { a: 1 },
+          {
+            auth: { username: "svc_account", password: "hunter2" },
+            adapter: captureAdapter(seen, '{"ok":true}'),
+          },
+        );
+
+        assert.strictEqual(leaked.length, 0, "polluted gadget was invoked");
+        assert.strictEqual(seen.config.data, '{"a":1}');
+        assert.deepStrictEqual(response.data, { ok: true });
+      });
+
+      it("should not use a polluted formSerializer for urlencoded bodies", async function () {
+        const seen = {};
+        let visitorInvoked = false;
+
+        pollute("formSerializer", {
+          visitor: function () {
+            visitorInvoked = true;
+            this.append("injected", "yes");
+            return false;
+          },
+        });
+
+        await axios.post(
+          "/form",
+          { a: "1" },
+          {
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            adapter: captureAdapter(seen),
+          },
+        );
+
+        assert.strictEqual(visitorInvoked, false);
+        assert.strictEqual(seen.config.data, "a=1");
+      });
+
+      it("should not use a polluted env.FormData in the default transformRequest", function () {
+        let fakeConstructed = false;
+
+        function FakeFormData() {
+          fakeConstructed = true;
+        }
+        FakeFormData.prototype.append = function () {};
+
+        pollute("env", { FormData: FakeFormData });
+
+        const result = defaults.transformRequest[0].call(
+          {},
+          { a: "1" },
+          AxiosHeaders.from({ "Content-Type": "multipart/form-data" }),
+        );
+
+        assert.strictEqual(fakeConstructed, false);
+        assert.ok(!(result instanceof FakeFormData));
+      });
+
+      it("should not use a polluted transitional in the default transformResponse", function () {
+        pollute("transitional", {
+          silentJSONParsing: true,
+          forcedJSONParsing: false,
+          clarifyTimeoutError: false,
+        });
+
+        const result = defaults.transformResponse[0].call({}, '{"a":1}');
+
+        assert.deepStrictEqual(result, { a: 1 });
+      });
+
+      it("should not use a polluted responseType in the default transformResponse", function () {
+        pollute("responseType", "text");
+
+        const result = defaults.transformResponse[0].call({}, '{"a":1}');
+
+        assert.deepStrictEqual(result, { a: 1 });
+      });
+    });
+
+    describe("http adapter", function () {
+      it("should not route requests through a polluted transport (credential exfiltration)", async function () {
+        this.timeout(10000);
+        let hijacked;
+        const server = await startEchoServer();
+
+        try {
+          pollute("transport", {
+            request: function (options, cb) {
+              hijacked = options;
+              return http.request(options, cb);
+            },
+          });
+
+          const response = await axios.get(serverURL(server, "/secret"), {
+            auth: { username: "svc_account", password: "hunter2" },
+          });
+
+          assert.strictEqual(hijacked, undefined, "polluted transport intercepted the request");
+          assert.strictEqual(response.data.url, "/secret");
+          assert.strictEqual(
+            response.data.authorization,
+            "Basic " + Buffer.from("svc_account:hunter2").toString("base64"),
+          );
+        } finally {
+          delete Object.prototype.transport;
+          await stopServer(server);
+        }
+      });
+
+      it("should not route requests through a polluted transport when the http adapter gets a plain config", async function () {
+        this.timeout(10000);
+        let hijacked;
+        const server = await startEchoServer();
+
+        try {
+          pollute("transport", {
+            request: function (options, cb) {
+              hijacked = options;
+              return http.request(options, cb);
+            },
+          });
+
+          const response = await httpAdapter({
+            method: "get",
+            url: serverURL(server, "/direct"),
+            headers: {},
+            proxy: false,
+            maxRedirects: 0,
+            maxContentLength: -1,
+            maxBodyLength: -1,
+            timeout: 0,
+          });
+          const data = JSON.parse(response.data);
+
+          assert.strictEqual(hijacked, undefined, "polluted transport intercepted the request");
+          assert.strictEqual(data.url, "/direct");
+        } finally {
+          delete Object.prototype.transport;
+          await stopServer(server);
+        }
+      });
+
+      it("should still honor an own transport", async function () {
+        let captured;
+
+        const response = await axios.get("http://stub.invalid/own", {
+          transport: stubTransport('{"ok":true}', function (options) {
+            captured = options;
+          }),
+          maxRedirects: 0,
+        });
+
+        assert.ok(captured, "own transport was not invoked");
+        assert.deepStrictEqual(response.data, { ok: true });
+      });
+
+      it("should not pass a polluted lookup/family to the transport", async function () {
+        let captured;
+        let lookupInvoked = false;
+
+        pollute("lookup", function (hostname, opt, cb) {
+          lookupInvoked = true;
+          cb(null, "127.0.0.1", 4);
+        });
+        pollute("family", 6);
+
+        await axios.get("http://stub.invalid/", {
+          transport: stubTransport('{"ok":true}', function (options) {
+            captured = options;
+          }),
+          maxRedirects: 0,
+        });
+
+        assert.ok(captured, "transport was not invoked");
+        assert.strictEqual(ownValue(captured, "lookup"), undefined);
+        assert.strictEqual(ownValue(captured, "family"), undefined);
+        assert.strictEqual(lookupInvoked, false);
+      });
+
+      it("should not use a polluted responseType to change response decoding", async function () {
+        pollute("responseType", "arraybuffer");
+
+        const response = await axios.get("http://stub.invalid/", {
+          transport: stubTransport('{"ok":true}'),
+          maxRedirects: 0,
+        });
+
+        assert.deepStrictEqual(response.data, { ok: true });
+      });
+
+      it("should not use a polluted responseEncoding to change response decoding", async function () {
+        pollute("responseEncoding", "base64");
+
+        const response = await axios.get("http://stub.invalid/", {
+          transport: stubTransport('{"ok":true}'),
+          maxRedirects: 0,
+        });
+
+        assert.deepStrictEqual(response.data, { ok: true });
+      });
+
+      it("should not let a polluted validateStatus accept error responses", async function () {
+        pollute("validateStatus", function () {
+          return true;
+        });
+
+        let error;
+        try {
+          await axios.get("http://stub.invalid/", {
+            transport: stubTransport('{"error":true}', null, 500),
+            maxRedirects: 0,
+          });
+        } catch (err) {
+          error = err;
+        }
+
+        assert.ok(error, "a 500 response was accepted");
+        assert.strictEqual(error.response.status, 500);
+      });
+
+      it("should not use a polluted env.Blob for data: URIs", async function () {
+        let fakeConstructed = false;
+
+        function FakeBlob() {
+          fakeConstructed = true;
+        }
+
+        pollute("env", { Blob: FakeBlob });
+
+        let response;
+        let error;
+        try {
+          response = await httpAdapter({
+            method: "get",
+            url: "data:text/plain;base64,SGVsbG8=",
+            headers: {},
+            responseType: "blob",
+            maxRedirects: 0,
+            maxContentLength: -1,
+            maxBodyLength: -1,
+            timeout: 0,
+          });
+        } catch (err) {
+          // Runtimes without a global Blob reject ("Blob is not supported") once
+          // the polluted constructor is ignored; that is an acceptable outcome.
+          error = err;
+        }
+
+        assert.strictEqual(fakeConstructed, false);
+        if (error) {
+          assert.ok(/Blob is not supported/.test(error.message), error.message);
+        }
+        if (response) {
+          assert.ok(!(response.data instanceof FakeBlob));
+        }
+      });
     });
   });
 });
